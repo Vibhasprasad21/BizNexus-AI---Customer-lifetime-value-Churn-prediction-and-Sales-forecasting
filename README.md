@@ -31,8 +31,6 @@ All in one unified application!
 - [Data Requirements](#data-requirements)
 - [Technology Stack](#technology-stack)
 - [Project Structure](#project-structure)
-- [Contributing](#contributing)
-- [License](#license)
 
 ---
 
