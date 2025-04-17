@@ -9,6 +9,7 @@ Sales Forecasting: Accurately predict future sales and revenue with advanced tim
 AI Business Assistant: Get instant answers to your business questions with our conversational AI chatbot.
 Interactive Dashboards: Visualize key business metrics with dynamic, interactive charts.
 Intelligent Alerts: Receive notifications about potential business risks via email.
+
 Table of Contents
 Installation
 Configuration
