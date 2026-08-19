@@ -7,7 +7,7 @@ from datetime import datetime
 
 # Import models and utilities
 from src.auth.session import requires_auth, get_user_info, get_company_id
-from src.firebase.firestore import save_dataset
+from src.database.store import save_dataset
 from src.reports.customer_report_generator import download_customer_report
 
 class CustomerLookupPage:
@@ -163,51 +163,62 @@ class CustomerLookupPage:
                 return {}
                 
             customer_details = customer_df.loc[customer_mask].iloc[0]
-            
+
             # Merge additional analyses if available in session state
             customer_details_dict = customer_details.to_dict()
-            
-            # Add mock CLV and Churn data for testing
-            customer_details_dict['CLV_Predicted_CLV'] = np.random.uniform(500, 5000)
-            customer_details_dict['CLV_Value_Tier'] = np.random.choice(['High', 'Medium', 'Low'])
-            customer_details_dict['Churn_Probability'] = np.random.uniform(0, 1)
-            customer_details_dict['Churn_Risk_Category'] = np.random.choice(['High Risk', 'Medium Risk', 'Low Risk'])
-            customer_details_dict['Recent_Product_Categories'] = np.random.choice(['Electronics', 'Services', 'Subscriptions'])
-            
-            # Merge CLV results if available
-            if 'clv_results' in st.session_state and st.session_state.clv_results is not None:
+
+            # Real top product category, if feature engineering computed one -
+            # the rest of this page reads it under 'Recent_Product_Categories'.
+            customer_details_dict['Recent_Product_Categories'] = (
+                customer_details_dict.get('Top_Product_Category')
+                or customer_details_dict.get('Preferred_Category')
+                or 'Unknown'
+            )
+
+            # Merge CLV results if available. The rest of the page reads
+            # specific keys ('CLV_Predicted_CLV', 'CLV_Value_Tier') directly,
+            # so those are set explicitly here rather than via a generic
+            # prefix-every-column merge - the previous version prefixed
+            # every clv_results column with 'CLV_' and skipped any prefixed
+            # key that collided with a name already on the dict, which
+            # (combined with random placeholder values previously seeded
+            # under those same key names) meant a real CLV/tier value could
+            # never overwrite the placeholder even when analysis had run.
+            if st.session_state.get('clv_results') is not None:
                 try:
-                    clv_details = st.session_state.clv_results[
-                        (st.session_state.clv_results['Customer ID'] == selected_customer) | 
-                        (st.session_state.clv_results['Customer Name'] == selected_customer)
+                    clv_df = st.session_state.clv_results
+                    clv_details = clv_df[
+                        (clv_df['Customer ID'] == selected_customer) |
+                        (clv_df.get('Customer Name') == selected_customer)
                     ]
-                    
                     if not clv_details.empty:
-                        clv_details_dict = clv_details.iloc[0].to_dict()
-                        customer_details_dict.update({
-                            f'CLV_{k}': v for k, v in clv_details_dict.items() 
-                            if k not in customer_details_dict
-                        })
+                        row = clv_details.iloc[0]
+                        clv_col = 'CLV_Adjusted' if 'CLV_Adjusted' in clv_details.columns else 'CLV'
+                        customer_details_dict['CLV_Predicted_CLV'] = float(row.get(clv_col, 0) or 0)
+                        if 'Value_Tier' in clv_details.columns:
+                            customer_details_dict['CLV_Value_Tier'] = row.get('Value_Tier')
                 except Exception as e:
                     st.warning(f"Error retrieving CLV details: {e}")
-            
-            # Merge Churn results if available
-            if 'churn_results' in st.session_state and st.session_state.churn_results is not None:
+
+            # Merge Churn results if available, under the exact key names the
+            # rest of the page reads ('Churn_Probability', 'Churn_Risk_Category').
+            churn_results = st.session_state.get('churn_results')
+            if churn_results is not None and churn_results.get('churn_predictions') is not None:
                 try:
-                    churn_details = st.session_state.churn_results['churn_predictions'][
-                        (st.session_state.churn_results['churn_predictions']['Customer ID'] == selected_customer) | 
-                        (st.session_state.churn_results['churn_predictions']['Customer Name'] == selected_customer)
+                    churn_df = churn_results['churn_predictions']
+                    churn_details = churn_df[
+                        (churn_df['Customer ID'] == selected_customer) |
+                        (churn_df.get('Customer Name') == selected_customer)
                     ]
-                    
                     if not churn_details.empty:
-                        churn_details_dict = churn_details.iloc[0].to_dict()
-                        customer_details_dict.update({
-                            f'Churn_{k}': v for k, v in churn_details_dict.items() 
-                            if k not in customer_details_dict
-                        })
+                        row = churn_details.iloc[0]
+                        if 'Churn_Probability' in churn_details.columns:
+                            customer_details_dict['Churn_Probability'] = float(row.get('Churn_Probability', 0) or 0)
+                        if 'Churn_Risk_Category' in churn_details.columns:
+                            customer_details_dict['Churn_Risk_Category'] = row.get('Churn_Risk_Category')
                 except Exception as e:
                     st.warning(f"Error retrieving Churn details: {e}")
-            
+
             return customer_details_dict
             
         except Exception as e:

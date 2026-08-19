@@ -8,7 +8,7 @@ from datetime import datetime
 
 # Import necessary modules
 from src.auth.session import requires_auth, get_user_info, get_company_id, nav_to
-from src.firebase.firestore import save_dataset
+from src.database.store import save_dataset
 from src.data_processing.upload import validate_dataset, show_dataset_preview, save_uploaded_file
 from src.data_processing.preprocessing import preprocess_dataset
 from src.data_processing.feature_engineering import engineer_features
@@ -226,6 +226,18 @@ def main():
                         st.session_state.sales_ts_df = sales_ts_df
                         st.session_state.engineered_features = engineered_features
                         st.session_state.features_engineered = True
+
+                        # Persist dataset to the local database
+                        user_info = get_user_info()
+                        save_result = save_dataset(
+                            company_id=get_company_id(),
+                            dataset_name=dataset_name,
+                            dataset_description=dataset_description,
+                            df=result_df,
+                            user_id=user_info.get('user_id') if user_info else None
+                        )
+                        if save_result.get('success'):
+                            st.session_state.current_dataset_id = save_result['dataset_id']
                         
                         # Process and Analyze Button
                         if st.button("Process & Analyze Data", type="primary", use_container_width=True):

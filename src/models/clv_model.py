@@ -99,18 +99,19 @@ class EnhancedGammaGammaClvModel:
         # 1. Frequency and Purchase Metrics
         if 'Num_of_Purchases' in processed_df.columns and 'Frequency' not in processed_df.columns:
             processed_df['Frequency'] = processed_df['Num_of_Purchases']
-        
+
         # Log transform of frequency to handle skewness
-        processed_df['Log_Frequency'] = np.log1p(processed_df['Frequency'])
+        if 'Frequency' in processed_df.columns:
+            processed_df['Log_Frequency'] = np.log1p(processed_df['Frequency'])
         
         # 2. Monetary Value Enhancements
-        if 'Sales' in processed_df.columns:
+        if 'Sales' in processed_df.columns and 'Num_of_Purchases' in processed_df.columns:
             # Average transaction value with robust calculation
             mask = processed_df['Num_of_Purchases'] > 0
             processed_df.loc[mask, 'Average_Transaction_Amount'] = (
                 processed_df.loc[mask, 'Sales'] / processed_df.loc[mask, 'Num_of_Purchases']
             )
-            
+
             # Log transform of monetary value
             processed_df['Log_Monetary_Value'] = np.log1p(processed_df['Sales'])
         
@@ -354,50 +355,54 @@ class EnhancedGammaGammaClvModel:
         
         # Bayesian expected value
         return (monetary_value + v) * (p + frequency) / (p + frequency + 1) - v
-    def _predict_clv_weighted(self, frequency, monetary_value, time_horizon=12, discount_rate=0.1):
+    def _predict_clv_vectorized(self, frequency, monetary_value, tenure_days=None,
+                                 time_horizon=12, discount_rate=0.1, min_tenure_days=30):
         """
-        Enhanced CLV prediction with special handling for high-value customers
-        
-        Parameters:
-        -----------
-        frequency : float
-            Number of repeat purchases
-        monetary_value : float
-            Average transaction value
-        time_horizon : int, optional (default=12)
-            Prediction time horizon in months
-        discount_rate : float, optional (default=0.1)
-            Annual discount rate
-        
-        Returns:
-        --------
-        float
-            Predicted Customer Lifetime Value with weighted approach
+        Predict nominal (undiscounted) CLV over `time_horizon` months for every
+        customer at once.
+
+        frequency here is a LIFETIME purchase count (e.g. Total_Orders), not a
+        rate - annualizing it against tenure before projecting forward is the
+        whole point of this function. An earlier version of this model instead
+        multiplied the raw lifetime count directly by (time_horizon / 12),
+        which - for any customer with more than about a year of history -
+        treats their entire purchase history as if it were their rate for the
+        NEXT year alone, wildly overstating CLV (confirmed against Superstore:
+        it overstated the portfolio's implied revenue run-rate by roughly 8x).
+
+        CLV = Average_Order_Value * Annual_Purchase_Frequency * (time_horizon / 12)
+
+        Parameters
+        ----------
+        frequency : pd.Series
+            Lifetime purchase count per customer.
+        monetary_value : pd.Series
+            Average transaction value per customer.
+        tenure_days : pd.Series or None
+            Days since first purchase per customer. Customers are floored to
+            `min_tenure_days` before annualizing, so a customer with one
+            order two days ago doesn't get extrapolated into hundreds of
+            orders a year - and if tenure isn't available at all, every
+            customer falls back to being annualized over a flat 1 year.
+        time_horizon : int
+            Prediction horizon in months.
+        discount_rate : float
+            Annual discount rate (only used by the caller for CLV_Adjusted;
+            this method returns the nominal, undiscounted figure).
+
+        Returns
+        -------
+        pd.Series
+            Nominal CLV over the horizon, one value per customer.
         """
-        # First, get the standard prediction
-        standard_prediction = self._predict_clv(frequency, monetary_value, time_horizon, discount_rate)
-        
-        # For high monetary values, apply a weighted blend of models
-        if monetary_value > 1000:
-            # Apply a secondary "high-value customer" model
-            # This uses a more conservative growth estimate
-            conservative_expected_transaction = monetary_value * 0.95
-            conservative_expected_purchases = frequency * (1 + 1/(frequency+1))
-            conservative_scaled_purchases = conservative_expected_purchases * (time_horizon / 12)
-            conservative_prediction = conservative_expected_transaction * conservative_scaled_purchases
-            
-            # Apply discount
-            monthly_discount_rate = (1 + discount_rate) ** (1/12) - 1
-            monthly_value = conservative_prediction / time_horizon
-            conservative_discounted = sum(monthly_value / ((1 + monthly_discount_rate) ** i) for i in range(1, time_horizon + 1))
-            
-            # Weight between standard and conservative based on monetary value
-            weight = min(0.8, monetary_value / 5000)  # Cap weight at 0.8
-            weighted_prediction = (1 - weight) * standard_prediction + weight * conservative_discounted
-            
-            return weighted_prediction
-        
-        return standard_prediction
+        if tenure_days is None:
+            effective_tenure_days = pd.Series(365.0, index=frequency.index)
+        else:
+            effective_tenure_days = tenure_days.clip(lower=min_tenure_days)
+
+        annual_frequency = frequency * 365.0 / effective_tenure_days
+        nominal_clv = monetary_value * annual_frequency * (time_horizon / 12.0)
+        return nominal_clv.clip(lower=0).fillna(0)
     def _fit_hybrid_model(self, df):
         """
         Fit a hybrid model that combines statistical and ML approaches for better R²
@@ -551,105 +556,73 @@ class EnhancedGammaGammaClvModel:
         elif customer_segment == 'repeat' and 'Frequency' in clv_df.columns:
             clv_df = clv_df[clv_df['Frequency'] > 1].copy()
         
-        # Check if we need to predict CLV
-        if 'CLV' not in clv_df.columns:
-            if 'Average_Transaction_Amount' in clv_df.columns and 'Frequency' in clv_df.columns:
-                # Split data for training and validation
-                if train_test_split_ratio > 0:
-                    train_df, test_df = train_test_split(
-                        clv_df, 
-                        test_size=train_test_split_ratio, 
-                        random_state=42
-                    )
-                else:
-                    train_df = clv_df
-                    test_df = clv_df.copy()
-                
-                # Fit Gamma-Gamma model on training data
+        # Predict CLV from behavioral inputs (Frequency, Average_Transaction_Amount,
+        # Tenure_Days) whenever they're available. This always recomputes fresh -
+        # it deliberately does NOT defer to a pre-existing 'CLV' column (e.g. the
+        # bootstrap estimate feature engineering leaves on the dataframe), because
+        # doing so silently ignored this page's own time_horizon/discount_rate
+        # settings and just passed a differently-scoped number through unchanged.
+        if 'Average_Transaction_Amount' in clv_df.columns and 'Frequency' in clv_df.columns:
+            # Fit Gamma-Gamma model for diagnostic/reporting purposes (not on the
+            # critical path for Predicted_CLV itself - see _predict_clv_vectorized).
+            try:
                 self.fitted_parameters = self._fit_gamma_gamma_model(
-                    train_df['Average_Transaction_Amount'], 
-                    train_df['Frequency']
+                    clv_df['Average_Transaction_Amount'],
+                    clv_df['Frequency']
                 )
-                
                 if self.verbose:
                     print(f"Fitted Gamma-Gamma model parameters: {self.fitted_parameters}")
-                
-                # Create customer segments for targeted predictions
-                if 'Frequency' in clv_df.columns and 'Average_Transaction_Amount' in clv_df.columns:
-                    # Create RFM-based segmentation for prediction
-                    freq_mean = clv_df['Frequency'].mean()
-                    monetary_mean = clv_df['Average_Transaction_Amount'].mean()
-                    
-                    # Define segments
-                    clv_df['temp_segment'] = 'Medium'
-                    clv_df.loc[(clv_df['Frequency'] > freq_mean) & (clv_df['Average_Transaction_Amount'] > monetary_mean), 'temp_segment'] = 'High'
-                    clv_df.loc[(clv_df['Frequency'] <= freq_mean) & (clv_df['Average_Transaction_Amount'] <= monetary_mean), 'temp_segment'] = 'Low'
-                    
-                    # Calculate CLV with segment-specific approach
-                    clv_df['Predicted_CLV'] = clv_df.apply(
-                        lambda row: self._predict_clv_weighted(
-                            row['Frequency'], 
-                            row['Average_Transaction_Amount'],
-                            time_horizon=time_horizon, 
-                            discount_rate=discount_rate
-                        ) if row['temp_segment'] == 'High' else self._predict_clv(
-                            row['Frequency'], 
-                            row['Average_Transaction_Amount'],
-                            time_horizon=time_horizon, 
-                            discount_rate=discount_rate
-                        ), 
-                        axis=1
-                    )
-                    
-                    # Remove temporary segment column
-                    clv_df = clv_df.drop('temp_segment', axis=1)
-                
-                # Validate on test set
-                if train_test_split_ratio > 0 and 'CLV' in test_df.columns:
-                    test_df['Predicted_CLV'] = test_df.apply(
-                        lambda row: self._predict_clv(
-                            row['Frequency'], 
-                            row['Average_Transaction_Amount'],
-                            time_horizon=time_horizon, 
-                            discount_rate=discount_rate
-                        ), 
-                        axis=1
-                    )
-                    
-                    # Calculate validation metrics
+            except Exception as e:
+                self.fitted_parameters = {'converged': False}
+                if self.verbose:
+                    print(f"Gamma-Gamma fit failed, continuing without it: {e}")
+
+            clv_df['Predicted_CLV'] = self._predict_clv_vectorized(
+                clv_df['Frequency'],
+                clv_df['Average_Transaction_Amount'],
+                clv_df['Tenure_Days'] if 'Tenure_Days' in clv_df.columns else None,
+                time_horizon=time_horizon,
+                discount_rate=discount_rate
+            )
+
+            # If a prior CLV estimate exists (e.g. from feature engineering),
+            # use it purely as an out-of-sample sanity check on this page's
+            # own prediction - never to overwrite it.
+            if train_test_split_ratio > 0 and 'CLV' in clv_df.columns:
+                try:
                     self.validation_metrics = self._calculate_validation_metrics(
-                        test_df['CLV'], 
-                        test_df['Predicted_CLV']
+                        clv_df['CLV'],
+                        clv_df['Predicted_CLV']
                     )
-                    
                     if self.verbose:
                         print(f"Validation Metrics: {self.validation_metrics}")
-            
-            elif 'CLV' in clv_df.columns:
-                # Use existing CLV values
-                clv_df['Predicted_CLV'] = clv_df['CLV']
-        else:
-            # Use existing CLV values but map to expected column names
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Validation metrics failed: {e}")
+
+        elif 'CLV' in clv_df.columns:
+            # Behavioral inputs aren't available for this dataset shape - fall
+            # back to whatever CLV estimate is already present rather than fail.
             clv_df['Predicted_CLV'] = clv_df['CLV']
-        
-        # Calculate discounted CLV if not already present
-        if 'Discounted_CLV' not in clv_df.columns and 'Predicted_CLV' in clv_df.columns:
-            # Apply monthly discount rate
-            monthly_discount_rate = (1 + discount_rate) ** (1/12) - 1
-            
-            # Calculate discounted CLV
-            discounted_values = []
-            for clv in clv_df['Predicted_CLV']:
-                monthly_value = clv / time_horizon
-                discounted_clv = sum(monthly_value / ((1 + monthly_discount_rate) ** i) for i in range(1, time_horizon + 1))
-                discounted_values.append(discounted_clv)
-            
-            clv_df['CLV_Adjusted'] = discounted_values
-        elif 'Discounted_CLV' in clv_df.columns:
-            clv_df['CLV_Adjusted'] = clv_df['Discounted_CLV']
         else:
-            clv_df['CLV_Adjusted'] = clv_df['Predicted_CLV']
-        
+            raise ValueError(
+                "Cannot compute CLV: dataset has neither Frequency/Average_Transaction_Amount "
+                "nor a precomputed CLV column."
+            )
+
+        # Discount Predicted_CLV (a nominal, undiscounted total over the horizon)
+        # to a present value, spreading it evenly across the horizon's months.
+        # Always derived from the Predicted_CLV computed above - not from any
+        # pre-existing 'Discounted_CLV' column, for the same reason as above.
+        monthly_discount_rate = (1 + discount_rate) ** (1 / 12) - 1
+        # Sum of 1/(1+r)^i for i=1..time_horizon is constant across every row,
+        # so compute it once instead of looping per customer.
+        discount_factor_sum = sum(
+            1 / ((1 + monthly_discount_rate) ** i) for i in range(1, time_horizon + 1)
+        )
+        monthly_value = clv_df['Predicted_CLV'] / time_horizon
+        clv_df['CLV_Adjusted'] = monthly_value * discount_factor_sum
+
         # Apply outlier handling
         if outlier_handling == 'cap':
             upper_limit = clv_df['CLV_Adjusted'].quantile(0.99)
@@ -751,47 +724,6 @@ class EnhancedGammaGammaClvModel:
         
         return metrics
     
-    def _predict_clv(self, frequency, monetary_value, time_horizon=12, discount_rate=0.1):
-        """
-        Sophisticated CLV prediction with multiple techniques
-        """
-        # Prevent invalid inputs
-        if frequency <= 0 or monetary_value <= 0:
-            return 0
-        
-        # Advanced parameter estimation
-        p = self.fitted_parameters.get('p', 0.6)
-        v = self.fitted_parameters.get('v', 4.0)
-        
-        # Non-linear transaction value estimation
-        expected_transaction = (
-            monetary_value * (1 + np.log(frequency + 1) / (frequency + 1)) * 
-            (p + frequency) / (p + frequency + 1)
-        )
-        
-        # Advanced frequency projection
-        purchase_projection = frequency * (
-            1 + 1 / np.sqrt(frequency + 1)
-        ) * (time_horizon / 12)
-        
-        # Sophisticated discounting
-        monthly_discount_rate = (1 + discount_rate) ** (1/12) - 1
-        
-        # Weighted time horizon calculation
-        time_decay_weights = np.exp(-0.1 * np.arange(time_horizon))
-        time_decay_weights /= time_decay_weights.sum()
-        
-        # Calculate discounted CLV with time decay
-        discounted_clv_components = [
-            expected_transaction * purchase_projection * time_decay_weights[i] / 
-            ((1 + monthly_discount_rate) ** (i + 1))
-            for i in range(time_horizon)
-        ]
-        
-        # Final CLV calculation with non-linear scaling
-        final_clv = np.sum(discounted_clv_components)
-        
-        return max(0, final_clv)
     def segment_customers(self, clv_df, num_segments=4):
         """
         Segment customers based on their predicted Lifetime Value

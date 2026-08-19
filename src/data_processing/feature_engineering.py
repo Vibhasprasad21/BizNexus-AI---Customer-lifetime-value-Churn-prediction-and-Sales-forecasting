@@ -249,27 +249,33 @@ def engineer_features(df):
     # ======== Prediction Targets ========
     
     # 1. Customer Lifetime Value (CLV) Calculation
-    
-    # Simple CLV calculation
-    # CLV = Average Order Value × Purchase Frequency × Customer Lifespan
-    # Estimate customer lifespan as 3x the current tenure
-    customer_df['Estimated_Lifespan'] = customer_df['Tenure_Days'] * 3
-    customer_df['Estimated_Lifespan'] = customer_df['Estimated_Lifespan'].clip(lower=365)  # Minimum 1 year
-    
-    customer_df['CLV'] = customer_df['Average_Transaction_Amount'] * customer_df['Purchase_Frequency'] * customer_df['Estimated_Lifespan']
-    
-    # Add discounted CLV calculation with 10% annual discount rate
+    #
+    # A bootstrap 12-month CLV estimate, used by churn scoring and other
+    # early consumers before the dedicated CLV Analysis page has run (that
+    # page recomputes its own CLV from these same behavioral inputs, honoring
+    # whatever time_horizon/discount_rate the user picks there).
+    #
+    # CLV = Annualized_Spend (Total_Sales / Tenure_Years, already computed
+    # above) projected over the horizon. An earlier version of this formula
+    # multiplied Average_Transaction_Amount x Purchase_Frequency (orders per
+    # DAY) x Estimated_Lifespan (3x tenure in days, floored at a year) - since
+    # orders-per-day x tenure-in-days cancels out to roughly 3x a customer's
+    # total historical order count, that projected three times a customer's
+    # entire purchase history as their NEXT 12 months alone, overstating
+    # portfolio CLV by roughly 8x against actual revenue on real data.
+    clv_horizon_months = 12
+    customer_df['CLV'] = (customer_df['Annualized_Spend'] * (clv_horizon_months / 12)).clip(lower=0)
+
+    # Discount to present value: 10% annual discount rate, monthly compounding,
+    # spread evenly across the horizon (matches the CLV Analysis page's method).
     discount_rate = 0.1
-    daily_discount_rate = (1 + discount_rate)**(1/365) - 1
-    
-    # Simplify by using continuous discounting formula
-    customer_df['Discounted_CLV'] = customer_df['Average_Transaction_Amount'] * customer_df['Purchase_Frequency'] * \
-                                  (1 - np.exp(-customer_df['Estimated_Lifespan'] * np.log(1 + daily_discount_rate))) / \
-                                  np.log(1 + daily_discount_rate)
-    
-    # Clip CLV to reasonable values
-    customer_df['CLV'] = customer_df['CLV'].clip(lower=0)
-    customer_df['Discounted_CLV'] = customer_df['Discounted_CLV'].clip(lower=0)
+    monthly_discount_rate = (1 + discount_rate) ** (1 / 12) - 1
+    discount_factor_sum = sum(
+        1 / (1 + monthly_discount_rate) ** i for i in range(1, clv_horizon_months + 1)
+    )
+    customer_df['Discounted_CLV'] = (
+        (customer_df['CLV'] / clv_horizon_months) * discount_factor_sum
+    ).clip(lower=0)
     engineered_features.extend(['CLV', 'Discounted_CLV'])
     
     # 2. Churn Prediction Label

@@ -368,11 +368,12 @@ def main():
         {"icon": "💰", "title": "Customer Lifetime Value", "desc": "Identify high-value customers and optimize retention strategies with our AI-powered CLV predictions."},
         {"icon": "🚀", "title": "Churn Prediction", "desc": "Spot at-risk customers before they leave and implement targeted retention campaigns."},
         {"icon": "📈", "title": "Sales Forecasting", "desc": "Accurately predict future sales and revenue with our advanced time-series models."},
-        {"icon": "🤖", "title": "AI Business Assistant", "desc": "Get instant answers to your business questions with our conversational AI chatbot."}
+        {"icon": "🤖", "title": "AI Business Assistant", "desc": "Get instant answers to your business questions with our conversational AI chatbot."},
+        {"icon": "🕵️", "title": "Autonomous AI Agent", "desc": "Monitors your data on its own, flags what matters, and logs recommendations with a full reasoning trail."}
     ]
-    
+
     # Create feature boxes with staggered animation
-    cols = st.columns(4)
+    cols = st.columns(len(features))
     for i, (col, feature) in enumerate(zip(cols, features)):
         with col:
             st.markdown(f"""

@@ -1,6 +1,6 @@
 import streamlit as st
 import time
-from src.auth.firebase_auth import login_user, register_user, is_valid_email
+from src.database.auth import login_user, register_user, is_valid_email
 import streamlit.components.v1 as components
 import os
 from dotenv import load_dotenv

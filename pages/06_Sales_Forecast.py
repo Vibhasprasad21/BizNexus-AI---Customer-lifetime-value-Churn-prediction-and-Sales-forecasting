@@ -10,11 +10,11 @@ from datetime import datetime, timedelta
 # Notification and Authentication Imports
 
 from src.auth.session import requires_auth, get_user_info, get_company_id
-from src.auth.firebase_auth import retrieve_user_smtp_config, encrypt_sensitive_data, decrypt_sensitive_data
 
 # Reporting and Model Imports
 from src.reports.sales_report_generator import download_report
 from src.models.sales_forecasting_model import SalesForecastingModel
+from src.agent.data_access import persist_forecast_results
 
 # PDF and Excel Generation Imports
 from reportlab.lib.pagesizes import letter
@@ -272,11 +272,24 @@ class AdvancedSalesForecastingDashboard:
                 
                 # Check for sales risk
                 is_high_risk = self._check_for_sales_risk(forecast_results)
-                
+
                 # If high risk is detected, send an alert
                 if is_high_risk:
                     self._send_sales_risk_alert()
-                
+
+                # Persist so the AI Agent can perceive this forecast even
+                # outside this browser session (background/scheduled runs).
+                try:
+                    persist_forecast_results(
+                        st.session_state.get('company_id'),
+                        st.session_state.get('current_dataset_id'),
+                        forecast_results,
+                        growth_rate=st.session_state.get('sales_growth_rate'),
+                        volatility=st.session_state.get('sales_volatility'),
+                    )
+                except Exception:
+                    pass
+
                 return forecast_results
             else:
                 # Fallback to mock data if real forecast failed
@@ -291,24 +304,40 @@ class AdvancedSalesForecastingDashboard:
             # Fallback to mock data
             return self._generate_mock_forecast_data(config)
 
+    @staticmethod
+    def _compute_growth_rate(forecast_data):
+        """
+        Percent change between the start and end of the forecast period,
+        using the average of the first and last ~10% of the horizon (at
+        least 3 points, or the whole series if it's shorter) rather than two
+        single endpoints. A single-point comparison on a daily forecast can
+        land on a seasonal peak or trough and report a swing that has
+        nothing to do with the underlying trend - this smooths past that.
+        """
+        values = forecast_data['Forecast']
+        window = max(3, min(len(values) // 10, len(values) // 2))
+        if window < 1 or len(values) < 2:
+            return 0.0
+        start_avg = values.iloc[:window].mean()
+        end_avg = values.iloc[-window:].mean()
+        if start_avg == 0:
+            return 0.0
+        return (end_avg / start_avg - 1) * 100
+
     def _check_for_sales_risk(self, forecast_data):
         """
         Check for high risk conditions in sales forecast and save to session_state
-        
+
         Args:
             forecast_data (pd.DataFrame): Sales forecast data
-        
+
         Returns:
             bool: True if high risk is detected, False otherwise
         """
         try:
             # Calculate key metrics
             # Looks at negative growth rate or dramatic forecast decrease
-            
-            # Calculate the growth trajectory (slope of forecast)
-            first_forecast = forecast_data['Forecast'].iloc[0]
-            last_forecast = forecast_data['Forecast'].iloc[-1]
-            growth_rate = (last_forecast / first_forecast - 1) * 100
+            growth_rate = self._compute_growth_rate(forecast_data)
             
             # Store sales forecast in session state
             st.session_state['sales_forecast'] = forecast_data['Forecast'].mean()
@@ -397,11 +426,11 @@ class AdvancedSalesForecastingDashboard:
             )
             
             if sent:
-                st.toast("✉️ Sales Risk Alert Sent!", icon="🚨")
-                st.success(f"🔔 Alert sent to {user_email}")
+                st.toast("🚨 Sales Risk Alert Recorded!", icon="🚨")
+                st.success("🔔 A sales risk alert has been added to your notifications.")
             else:
-                st.error("❌ Failed to send sales risk alert")
-            
+                st.error("❌ Failed to record sales risk alert")
+
             return sent
         
         except Exception as e:
@@ -525,47 +554,111 @@ class AdvancedSalesForecastingDashboard:
             )
             st.plotly_chart(fig_promo, use_container_width=True)
     
+    def _backtest_forecast_accuracy(self, holdout_days=30):
+        """
+        Real backtested accuracy: hold out the most recent `holdout_days` of
+        ACTUAL transaction history, generate a forecast for that same window
+        using only the data before it, and compare predicted vs. actual total
+        revenue for the window. Returns a 0-100 accuracy percentage, or None
+        if there isn't enough history to backtest meaningfully (needs at
+        least `holdout_days` of data before the holdout window too).
+
+        This replaces a hardcoded "95%" that had no methodology behind it -
+        found during QA to be a literal constant, not a computed metric.
+        """
+        result_df = st.session_state.get('result_df')
+        if result_df is None or len(result_df) == 0:
+            return None
+
+        date_col = next((c for c in result_df.columns if any(t in c.lower() for t in ['date', 'time', 'day'])), None)
+        amount_col = next((c for c in result_df.columns if any(t in c.lower() for t in ['amount', 'price', 'revenue', 'sales', 'value'])), None)
+        if not date_col or not amount_col:
+            return None
+
+        df = result_df[[date_col, amount_col]].copy()
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df = df.dropna(subset=[date_col])
+        if df.empty:
+            return None
+
+        last_date = df[date_col].max()
+        cutoff = last_date - pd.Timedelta(days=holdout_days)
+        train_df = df[df[date_col] <= cutoff]
+        actual_holdout = df[df[date_col] > cutoff]
+
+        # Require at least as much history before the cutoff as the holdout
+        # itself, so the backtest isn't extrapolating from a handful of rows.
+        if train_df.empty or actual_holdout.empty:
+            return None
+        if (cutoff - train_df[date_col].min()).days < holdout_days:
+            return None
+
+        actual_total = actual_holdout[amount_col].sum()
+        if actual_total <= 0:
+            return None
+
+        try:
+            backtest_model = SalesForecastingModel(
+                transaction_data=train_df,
+                config={'forecast_horizon': holdout_days}
+            )
+            backtest_forecast = backtest_model.generate_forecast()
+        except Exception:
+            return None
+
+        if backtest_forecast is None or backtest_forecast.empty:
+            return None
+
+        predicted_total = backtest_forecast['Forecast'].sum()
+        error_pct = abs(predicted_total - actual_total) / actual_total * 100
+        return max(0.0, min(100.0, 100.0 - error_pct))
+
     def _generate_kpi_metrics(self, forecast_data):
         """
         Generate and display key performance indicators
-        
+
         Args:
             forecast_data (pd.DataFrame): Forecast data
         """
         st.markdown("## 📈 Key Performance Indicators")
-        
+
         # Prepare KPI calculations
         total_forecast = forecast_data['Forecast'].sum()
         avg_daily_sales = forecast_data['Forecast'].mean()
-        growth_rate = (forecast_data['Forecast'].iloc[-1] / forecast_data['Forecast'].iloc[0] - 1) * 100
-        
+        growth_rate = self._compute_growth_rate(forecast_data)
+        backtest_accuracy = self._backtest_forecast_accuracy()
+
         # Create columns for KPIs
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
             st.markdown('<div class="metric-value">${:,.0f}</div>'.format(total_forecast), unsafe_allow_html=True)
             st.markdown('<div class="metric-label">Total Sales Forecast</div>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
-        
+
         with col2:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
             st.markdown('<div class="metric-value">${:,.0f}</div>'.format(avg_daily_sales), unsafe_allow_html=True)
             st.markdown('<div class="metric-label">Average Daily Sales</div>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
-        
+
         with col3:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
             st.markdown('<div class="metric-value">{:.1f}%</div>'.format(growth_rate), unsafe_allow_html=True)
             st.markdown('<div class="metric-label">Sales Growth Rate</div>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
-        
+
         with col4:
             st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-            st.markdown('<div class="metric-value">{:.1f}%</div>'.format(95), unsafe_allow_html=True)
-            st.markdown('<div class="metric-label">Forecast Accuracy</div>', unsafe_allow_html=True)
+            if backtest_accuracy is not None:
+                st.markdown('<div class="metric-value">{:.1f}%</div>'.format(backtest_accuracy), unsafe_allow_html=True)
+                st.markdown('<div class="metric-label">Backtested Accuracy (30d)</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="metric-value">N/A</div>', unsafe_allow_html=True)
+                st.markdown('<div class="metric-label">Backtested Accuracy (needs 60+ days of history)</div>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
-        
+
         # Scenario Planning Section
         st.markdown("## 🎯 Scenario Planning")
         scenario_columns = st.columns(3)
@@ -769,19 +862,45 @@ class AdvancedSalesForecastingDashboard:
     
     def _customer_segmentation_analysis(self):
         """
-        Perform customer segmentation analysis
+        Customer segmentation analysis, built from this company's actual
+        CLV/churn results (Value_Tier x average CLV x average churn risk) -
+        not simulated data. Requires CLV Analysis (and, for churn risk,
+        Churn Prediction) to have been run first.
         """
         st.markdown("## 👥 Customer Segmentation Analysis")
-        
-        # Simulate customer segmentation data
-        np.random.seed(42)
-        customer_segments = pd.DataFrame({
-            'Segment': ['High-Value', 'Medium-Value', 'Low-Value', 'At-Risk'],
-            'Count': [500, 1500, 2000, 1000],
-            'Average_CLV': [5000, 2000, 500, 750],
-            'Churn_Probability': [0.1, 0.3, 0.6, 0.8]
+
+        clv_results = st.session_state.get('clv_results')
+        if clv_results is None or len(clv_results) == 0 or 'Value_Tier' not in clv_results.columns:
+            st.info("Run CLV Analysis first to see real customer segmentation here.")
+            return
+
+        clv_col = 'CLV_Adjusted' if 'CLV_Adjusted' in clv_results.columns else 'CLV'
+        working = clv_results[['Customer ID', 'Value_Tier', clv_col]].copy()
+        working = working.rename(columns={clv_col: 'CLV'})
+
+        churn_predictions = st.session_state.get('churn_results', {}).get('churn_predictions')
+        if churn_predictions is not None and 'Churn_Probability' in churn_predictions.columns:
+            working = pd.merge(
+                working, churn_predictions[['Customer ID', 'Churn_Probability']],
+                on='Customer ID', how='left'
+            )
+
+        agg = {'CLV': ['count', 'mean']}
+        if 'Churn_Probability' in working.columns:
+            agg['Churn_Probability'] = 'mean'
+
+        grouped = working.groupby('Value_Tier', observed=True).agg(agg)
+        grouped.columns = ['_'.join(c).strip('_') for c in grouped.columns]
+        grouped = grouped.reset_index().rename(columns={
+            'Value_Tier': 'Segment', 'CLV_count': 'Count', 'CLV_mean': 'Average_CLV',
         })
-        
+        if 'Churn_Probability_mean' in grouped.columns:
+            grouped = grouped.rename(columns={'Churn_Probability_mean': 'Churn_Probability'})
+        else:
+            grouped['Churn_Probability'] = None
+
+        customer_segments = grouped
+
         # Customer Segment Distribution
         col1, col2 = st.columns(2)
         
@@ -813,60 +932,14 @@ class AdvancedSalesForecastingDashboard:
         
         for i, (_, segment) in enumerate(customer_segments.iterrows()):
             with insights_cols[i]:
+                churn_risk = segment.get('Churn_Probability')
+                churn_risk_text = f"{churn_risk:.0%}" if pd.notna(churn_risk) else "N/A (run Churn Prediction)"
                 st.markdown('<div class="metric-card">', unsafe_allow_html=True)
                 st.markdown(f'<div class="metric-value">{segment["Count"]}</div>', unsafe_allow_html=True)
                 st.markdown(f'<div class="metric-label">{segment["Segment"]} Customers</div>', unsafe_allow_html=True)
                 st.markdown(f'<div class="metric-label">Avg CLV: ${segment["Average_CLV"]:,.0f}</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="metric-label">Churn Risk: {segment["Churn_Probability"]:.0%}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-label">Churn Risk: {churn_risk_text}</div>', unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
-    def render(self):
-        """
-        Main rendering method for Advanced Sales Forecasting Dashboard
-        """
-        # Default to sales forecast page
-        st.title("🚀 AI-Powered Sales Forecasting Dashboard")
-        
-        # Configuration Panel
-        config = self._configuration_panel()
-        
-        # Generate Forecast Data
-        if st.button("Generate Forecast", type="primary"):
-            # Generate mock forecast data based on configuration
-            forecast_data = self._generate_mock_forecast_data(config)
-            
-            # Sales Trend Visualizations
-            self._sales_trend_visualization(forecast_data)
-            
-            # KPI Metrics
-            self._generate_kpi_metrics(forecast_data)
-            
-            # Customer Segmentation Analysis
-            self._customer_segmentation_analysis()
-            
-            # Scenario Sensitivity Analysis
-            self._scenario_sensitivity_analysis(forecast_data)
-            
-            # Export & Reporting Section (now at the end of the page)
-            self._report_export_section(forecast_data)
-        
-        # If forecast data already exists in session state, display it
-        elif 'forecast_data' in st.session_state and st.session_state.forecast_data is not None:
-            forecast_data = st.session_state.forecast_data
-            
-            # Sales Trend Visualizations
-            self._sales_trend_visualization(forecast_data)
-            
-            # KPI Metrics
-            self._generate_kpi_metrics(forecast_data)
-            
-            # Customer Segmentation Analysis
-            self._customer_segmentation_analysis()
-            
-            # Scenario Sensitivity Analysis
-            self._scenario_sensitivity_analysis(forecast_data)
-            
-            # Export & Reporting Section (now at the end of the page)
-            self._report_export_section(forecast_data)
     def _generate_mock_forecast_data(self, config):
         """
         Generate forecast data based on configuration
@@ -1046,9 +1119,12 @@ class AdvancedSalesForecastingDashboard:
         
         # Generate Forecast Data
         if st.button("Generate Forecast", type="primary"):
-            # Generate forecast using real data from session state
-            forecast_data = self._generate_mock_forecast_data(config)
-            
+            # Generate forecast using real data from session state (this method
+            # falls back to _generate_mock_forecast_data itself, with a visible
+            # warning, only if the real pipeline genuinely can't produce a
+            # forecast from the uploaded data).
+            forecast_data = self._generate_forecast_from_real_data(config)
+
             if forecast_data is not None:
                 # Sales Trend Visualizations
                 self._sales_trend_visualization(forecast_data)

@@ -9,8 +9,9 @@ from datetime import datetime
 from src.alerts.risk_alerts import check_churn_risk
 # Import models and utilities
 from src.auth.session import requires_auth, get_user_info, get_company_id,nav_to
-from src.firebase.firestore import save_dataset
+from src.database.store import save_dataset
 from src.models.clv_model import enhanced_main_clv_analysis, EnhancedGammaGammaClvModel
+from src.agent.data_access import persist_clv_results
 class CLVAnalysisPage:
     def __init__(self):
         # Page configuration
@@ -1600,10 +1601,10 @@ class CLVAnalysisPage:
             )
             
             if sent:
-                st.success("CLV risk alert sent to your email.")
+                st.success("CLV risk alert added to your notifications.")
             else:
-                st.error("Failed to send CLV risk alert email.")
-            
+                st.error("Failed to record CLV risk alert.")
+
             return sent
         
         except Exception as e:
@@ -1652,7 +1653,18 @@ class CLVAnalysisPage:
                 # Store results in session state for downloading
                 st.session_state.clv_results = clv_analysis['clv_results']
                 st.session_state.clv_descriptive_stats = clv_analysis['descriptive_stats']
-                
+
+                # Persist so the AI Agent can perceive this analysis even
+                # outside this browser session (background/scheduled runs).
+                try:
+                    persist_clv_results(
+                        st.session_state.get('company_id'),
+                        st.session_state.get('current_dataset_id'),
+                        clv_analysis['clv_results']
+                    )
+                except Exception:
+                    pass
+
                 # Store the model if available
                 if 'model' in clv_analysis:
                     st.session_state.clv_model = clv_analysis['model']

@@ -8,9 +8,12 @@ from datetime import datetime, timedelta
 import json
 import traceback
 import os
-# Import authentication decorator and chatbot assistant
+import html
+import markdown as md_render
+# Import authentication decorator and the agent's NL front-end
 from src.auth.session import requires_auth
-from src.chatbot.assistant import BizNexusAssistant
+from src.agent.nlp_router import route
+from src.agent.data_access import build_state
 
 class AIAssistantPage:
     def __init__(self):
@@ -24,10 +27,7 @@ class AIAssistantPage:
         
         # Apply enhanced professional styling
         self._apply_enhanced_styling()
-        
-        # Initialize the chatbot with business analytics capabilities
-        self.assistant = BizNexusAssistant()
-        
+
         # Initialize session state for chat history if it doesn't exist
         if 'chat_history' not in st.session_state:
             st.session_state.chat_history = []
@@ -151,7 +151,31 @@ class AIAssistantPage:
             opacity: 0.7;
         }
         .message-content {
-            white-space: pre-wrap;
+            line-height: 1.5;
+        }
+        .message-content h2 {
+            font-size: 1.15rem;
+            margin: 0.2rem 0 0.6rem 0;
+        }
+        .message-content h3 {
+            font-size: 1rem;
+            margin: 0.8rem 0 0.4rem 0;
+        }
+        .message-content table {
+            border-collapse: collapse;
+            margin: 0.5rem 0;
+            font-size: 0.9rem;
+        }
+        .message-content th, .message-content td {
+            border: 1px solid #e9ecef;
+            padding: 0.35rem 0.7rem;
+            text-align: left;
+        }
+        .message-content th {
+            background: #f8f9fa;
+        }
+        .message-content ul, .message-content ol {
+            margin: 0.3rem 0 0.3rem 1.2rem;
         }
         
         /* Business Analytics Suggestion Chips */
@@ -231,18 +255,21 @@ class AIAssistantPage:
     
     def _validate_data_availability(self):
         """
-        Validate that required data is available in session state
-        
+        Validate that customer data is available - either in this browser
+        session (just uploaded/analyzed) or already persisted for this
+        company (e.g. from an earlier session, or something the AI Agent
+        page's background/scheduled runs already picked up). Same
+        build_state() the agent itself perceives through, so this page
+        isn't stricter than what it's actually about to query.
+
         Returns:
             bool: True if data is available, False otherwise
         """
-        required_keys = ['customer_df']
-        
-        for key in required_keys:
-            if key not in st.session_state:
-                st.error(f"Missing {key}. Please complete data upload first.")
-                return False
-        
+        company_id = st.session_state.get('company_id')
+        state = build_state(company_id, session_state=st.session_state)
+        if state.get('customer_df') is None:
+            st.error("No customer data found yet. Please complete data upload first.")
+            return False
         return True
     
     def _display_enhanced_chat_interface(self):
@@ -281,18 +308,24 @@ class AIAssistantPage:
                         <span>You</span>
                         <span class="time">{message.get("time", datetime.now().strftime('%H:%M'))}</span>
                     </div>
-                    <div class="message-content">{message["content"]}</div>
+                    <div class="message-content">{html.escape(message["content"])}</div>
                     <div class="avatar">👤</div>
                 </div>
                 """, unsafe_allow_html=True)
             else:
+                # Response text is markdown (headers, bold, tables) - render it
+                # to HTML first, since markdown syntax embedded directly inside
+                # a raw HTML div (as opposed to a standalone st.markdown block)
+                # isn't parsed by most markdown engines and would show up as
+                # literal "##"/"**" characters instead of formatted text.
+                content_html = md_render.markdown(message["content"], extensions=['tables'])
                 st.markdown(f"""
                 <div class="chat-message assistant">
                     <div class="message-header">
                         <span>Business AI Assistant</span>
                         <span class="time">{message.get("time", datetime.now().strftime('%H:%M'))}</span>
                     </div>
-                    <div class="message-content">{message["content"]}</div>
+                    <div class="message-content">{content_html}</div>
                     <div class="avatar">🤖</div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -382,9 +415,11 @@ class AIAssistantPage:
             st.session_state.chat_responses = []
         
         try:
-            # Generate response from the assistant
-            response = self.assistant.generate_response(user_input, st.session_state)
-            
+            # Route the question to the same tools the autonomous agent uses
+            company_id = st.session_state.get('company_id')
+            state = build_state(company_id, session_state=st.session_state)
+            response = route(user_input, state)
+
             # Add assistant response to chat history with timestamp
             st.session_state.chat_history.append({"role": "assistant", "content": response["text"], "time": timestamp})
             
@@ -404,7 +439,11 @@ class AIAssistantPage:
         Main rendering method for enhanced AI Assistant page
         """
         st.title("🤖 BizNexus Business Analytics Assistant")
-        
+        st.caption("Ask a question in plain language - it's answered by the same tools the "
+                    "autonomous AI Agent uses to monitor your data. For the agent's own "
+                    "self-directed monitoring, recommendations, and activity log, see the "
+                    "**AI Agent** page in the sidebar.")
+
         # Validate data availability
         if not self._validate_data_availability():
             return

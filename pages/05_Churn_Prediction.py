@@ -7,13 +7,13 @@ import plotly.graph_objs as go
 import io
 from datetime import datetime
 from src.alerts.risk_alerts import check_churn_risk
+from src.agent.data_access import persist_churn_results
 # Notification and Authentication Imports
 
 from src.auth.session import requires_auth, get_user_info, get_company_id
-from src.auth.firebase_auth import retrieve_user_smtp_config, encrypt_sensitive_data, decrypt_sensitive_data
 
 # Firebase and Firestore Imports
-from src.firebase.firestore import save_dataset
+from src.database.store import save_dataset
 
 # Model Imports
 from src.models.churn_model import main_churn_analysis, EnhancedCLVChurnPredictionModel
@@ -344,9 +344,15 @@ class ChurnPredictionPage:
                             try:
                                 clv_df = st.session_state.clv_results
                                 if 'Customer ID' in clv_df.columns and 'Customer ID' in churn_predictions.columns:
+                                    # Prefer the dedicated CLV Analysis page's discounted
+                                    # figure (CLV_Adjusted) over the cruder upload-time
+                                    # bootstrap estimate, same reasoning as the agent's
+                                    # _canonical_clv helper in src/agent/tools.py.
+                                    clv_col = 'CLV_Adjusted' if 'CLV_Adjusted' in clv_df.columns else 'CLV'
+                                    clv_subset = clv_df[['Customer ID', clv_col]].rename(columns={clv_col: 'CLV'})
                                     merged_results = pd.merge(
                                         churn_predictions,
-                                        clv_df[['Customer ID', 'CLV']],
+                                        clv_subset,
                                         on='Customer ID',
                                         how='left'
                                     )
@@ -607,6 +613,22 @@ class ChurnPredictionPage:
             
             # Customer-Level Insights Tab
             with tabs[0]:
+                # Compact model performance summary up front - the full
+                # breakdown (with the churn-definition methodology note)
+                # lives in the "Churn Analysis Insights" tab, but a business
+                # analyst landing on this default tab should see at a glance
+                # whether the model is trustworthy without having to find it.
+                performance = churn_analysis.get('training_results', {}).get('performance')
+                if isinstance(performance, dict) and performance:
+                    perf_cols = st.columns(5)
+                    for col, (key, label) in zip(perf_cols, [
+                        ('accuracy', 'Accuracy'), ('precision', 'Precision'),
+                        ('recall', 'Recall'), ('f1_score', 'F1'), ('roc_auc', 'ROC-AUC'),
+                    ]):
+                        value = performance.get(key)
+                        col.metric(label, f"{value:.1%}" if value is not None else "N/A")
+                    st.caption("See the **Churn Analysis Insights** tab for what these mean and how churn is defined.")
+
                 col1, col2 = st.columns(2)
                 
                 with col1:
@@ -982,6 +1004,32 @@ class ChurnPredictionPage:
                     st.error(f"Error in business analysis visualizations: {str(e)}")
                     st.info("Try filtering your data or check if required columns are available.")
                             
+                # Model Performance Metrics
+                st.markdown("### 📊 Model Performance")
+                performance = churn_analysis.get('training_results', {}).get('performance')
+                if isinstance(performance, dict) and performance:
+                    perf_cols = st.columns(5)
+                    metric_labels = [
+                        ('accuracy', 'Accuracy'), ('precision', 'Precision'),
+                        ('recall', 'Recall'), ('f1_score', 'F1 Score'), ('roc_auc', 'ROC-AUC'),
+                    ]
+                    for col, (key, label) in zip(perf_cols, metric_labels):
+                        value = performance.get(key)
+                        col.metric(label, f"{value:.1%}" if value is not None else "N/A")
+
+                    st.caption(
+                        "ℹ️ **How churn is defined here:** this dataset has no explicit cancellation "
+                        "or unsubscribe event, so a customer is labeled 'churned' once they've gone "
+                        "more than 3x their own typical time-between-purchases without buying again. "
+                        "The model is trained to predict that rule from behavioral features (excluding "
+                        "the rule's own inputs), which is why recency-related factors dominate below - "
+                        "that's expected for this style of churn definition, not a sign the model is "
+                        "trivial. High accuracy here reflects that the label itself is close to "
+                        "rule-based, not that the model is unreliable."
+                    )
+                else:
+                    st.info("Model performance metrics were not available for this run.")
+
                 # Feature Importance
                 st.markdown("### 🔍 Top Churn Prediction Factors")
                 
@@ -1524,12 +1572,11 @@ class ChurnPredictionPage:
             )
             
             if sent:
-                # Use toast for non-intrusive notification
-                st.toast("✉️ Churn Risk Alert Sent!", icon="🚨")
-                st.success(f"🔔 An alert has been sent to {user_email}. Please check your inbox.")
+                st.toast("🚨 Churn Risk Alert Recorded!", icon="🚨")
+                st.success("🔔 A churn risk alert has been added to your notifications.")
             else:
-                st.error("❌ Failed to send churn risk alert. Please check your email configuration.")
-            
+                st.error("❌ Failed to record churn risk alert.")
+
             return sent
         
         except Exception as e:
@@ -1572,7 +1619,18 @@ class ChurnPredictionPage:
             if churn_analysis['success']:
                 # Store results in session state
                 st.session_state.churn_results = churn_analysis
-                
+
+                # Persist so the AI Agent can perceive this analysis even
+                # outside this browser session (background/scheduled runs).
+                try:
+                    persist_churn_results(
+                        st.session_state.get('company_id'),
+                        st.session_state.get('current_dataset_id'),
+                        churn_analysis['churn_predictions']
+                    )
+                except Exception:
+                    pass
+
                 # Show dataset preview
                 self._show_dataset_preview(churn_analysis['churn_predictions'])
                 

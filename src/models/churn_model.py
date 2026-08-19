@@ -100,15 +100,36 @@ class EnhancedCLVChurnPredictionModel:
         
         # Identify core features for churn prediction
         self.feature_names = [
-            'CLV', 'Frequency', 'Recency', 
+            'CLV', 'Frequency', 'Recency',
             'CLV_to_Avg_Transaction', 'CLV_to_Lifetime_Transactions'
         ]
-        
-        # Add any other potentially useful numeric features
+
+        # Columns that directly encode the Churn_Label target and must never
+        # be used as features - Churn_Label is built as
+        # (Recency > Expected_Purchase_Gap * 3) in feature_engineering.py, so
+        # including Expected_Purchase_Gap/Churn_Threshold_Days (or the
+        # near-duplicate Churn_Prediction_Nd flags built from the same gap)
+        # hands the model the exact rule used to construct its own target.
+        # That's not a real predictive signal, it's the model re-deriving a
+        # formula it was given - it will report near-100% accuracy while
+        # having learned nothing that generalizes to a customer whose
+        # behavior doesn't fit that fixed rule. Confirmed on real data: this
+        # was silently happening because the code below added "any other
+        # numeric column" as a feature with no exclusion list at all.
+        LEAKAGE_COLUMNS = {
+            'Churn_Score', 'Churn_Threshold_Days', 'Expected_Purchase_Gap',
+            'Churn_Prediction_30d', 'Churn_Prediction_60d', 'Churn_Prediction_90d',
+            'Avg_Time_Between_Purchases',
+        }
+
+        # Add any other potentially useful numeric features, excluding the
+        # target, identifiers, and the leakage columns above.
         for col in processed_df.columns:
-            if col in self.feature_names or col == 'Churn_Label' or col == 'Customer ID' or col == 'Customer Name':
-                continue  # Skip existing features, target and ID columns
-                
+            if (col in self.feature_names or col == 'Churn_Label'
+                    or col == 'Customer ID' or col == 'Customer Name'
+                    or col in LEAKAGE_COLUMNS):
+                continue  # Skip existing features, target, ID columns, and leakage
+
             if processed_df[col].dtype in ['int64', 'float64']:
                 self.feature_names.append(col)
         
@@ -482,32 +503,47 @@ def main_churn_analysis(customer_df, clv_df=None, time_horizon='90 Days', verbos
                 df['CLV'] = df['Predicted_CLV']
             elif 'Discounted_CLV' in df.columns:
                 df['CLV'] = df['Discounted_CLV']
+            elif 'Average_Transaction_Amount' in df.columns and 'Frequency' in df.columns and 'Tenure_Days' in df.columns:
+                # Same annualized-frequency estimate the CLV model uses,
+                # rather than a flat "3x total historical revenue" guess.
+                annual_frequency = df['Frequency'] * 365.0 / df['Tenure_Days'].clip(lower=30)
+                df['CLV'] = (df['Average_Transaction_Amount'] * annual_frequency).clip(lower=0)
             elif 'Total_Sales' in df.columns:
-                # Fallback to a simple approximation
-                df['CLV'] = df['Total_Sales'] * 3
+                # Last-resort approximation when there's not enough to annualize.
+                df['CLV'] = df['Total_Sales']
             else:
-                # Last resort - create a placeholder value
-                print("Warning: Creating synthetic CLV values")
+                # Truly nothing to base an estimate on.
+                print("Warning: No CLV or revenue data available - using a flat placeholder")
                 df['CLV'] = 1000
-        
+
         # Merge CLV information if provided
         if clv_df is not None and isinstance(clv_df, pd.DataFrame):
             try:
                 if 'Customer ID' in clv_df.columns and 'Customer ID' in df.columns:
                     # Identify CLV columns to merge
-                    clv_columns = ['Customer ID']
-                    for col in clv_df.columns:
-                        if 'CLV' in col or 'Value' in col:
-                            clv_columns.append(col)
-                    
+                    clv_columns = ['Customer ID'] + [
+                        col for col in clv_df.columns
+                        if col != 'Customer ID' and ('CLV' in col or 'Value' in col)
+                    ]
+                    clv_subset = clv_df[clv_columns].drop_duplicates(subset=['Customer ID'])
+
+                    # Drop any of these columns already on df first, so the
+                    # merge can't silently rename them to CLV_x/CLV_y - the
+                    # freshly analyzed CLV data is more authoritative than
+                    # whatever bootstrap estimate df already carries, and
+                    # downstream code expects a plain 'CLV' column to exist.
+                    overlapping = [c for c in clv_columns if c != 'Customer ID' and c in df.columns]
+                    if overlapping:
+                        df = df.drop(columns=overlapping)
+
                     # Merge the dataframes
                     df = pd.merge(
                         df,
-                        clv_df[clv_columns],
+                        clv_subset,
                         on='Customer ID',
                         how='left'
                     )
-                    
+
                     # Ensure CLV is filled after merge
                     if 'CLV' in clv_columns and df['CLV'].isna().any():
                         df['CLV'] = df['CLV'].fillna(df['CLV'].mean())

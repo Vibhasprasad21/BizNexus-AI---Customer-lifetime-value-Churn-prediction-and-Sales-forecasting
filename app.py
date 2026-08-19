@@ -71,45 +71,17 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-def check_for_sales_alerts():
-    """Check for sales alerts if data is available"""
-    if 'sales_data' in st.session_state:
-        # Get logged-in user's email
-        user_email = get_logged_in_user_email()
-        
-        if user_email:
-            # Run analysis on sales data
-            sales_data = st.session_state.sales_data
-            processed_data, alerts = alert_system.analyze_sales_data(sales_data)
-            
-            # Send alert if issues detected
-            if alerts:
-                company_name = st.session_state.get('company_name', 'Your Business')
-                alert_system.send_alert_email(alerts, user_email, company_name)
-
-
 # Main app execution
 def main():
     """Main application entry point"""
+    current_script = get_script_run_ctx().main_script_path
+
     # Check if the user is authenticated, otherwise redirect to authentication
     if not st.session_state.get("authenticated", False):
-        # Redirect to authentication page if not already there
-        current_script = get_script_run_ctx().main_script_path
-        if not current_script.endswith("Home.py") and "authentication" not in current_script:
-            navigate_to("pages/authentication.py")
-    
-    # Check for sales alerts after data upload
-    if st.session_state.get("authenticated", False) and 'sales_data' in st.session_state:
-        check_for_sales_alerts()
-        
-    ga_credentials = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
-    ga_property_id = os.environ.get('GA4_PROPERTY_ID')
-    
-    if not ga_credentials or not ga_property_id:
-        if not current_script.endswith("Home.py") and not current_script.endswith("authentication.py"):
-            st.warning("Google Analytics API is not fully configured. Some assistant features may be limited.")
+        if not current_script.endswith("Home.py") and "Authentication" not in current_script:
+            navigate_to("pages/02_Authentication.py")
+
     # If we're on the main app.py page, redirect to home
-    current_script = get_script_run_ctx().main_script_path
     if current_script.endswith("app.py"):
         navigate_to("pages/01_Home.py")
 

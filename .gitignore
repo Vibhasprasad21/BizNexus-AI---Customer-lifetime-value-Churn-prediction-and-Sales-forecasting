@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Local runtime data
+data/
+downloads/
+
+# Streamlit local secrets (placeholder values only in this repo, but this
+# file is where real credentials would go - never commit it)
+.streamlit/secrets.toml
+
+# OS/editor cruft
+.DS_Store
+*.swp
