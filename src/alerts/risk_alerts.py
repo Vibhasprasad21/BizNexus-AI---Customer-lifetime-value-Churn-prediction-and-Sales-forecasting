@@ -108,7 +108,7 @@ def check_sales_risk(company_id, sales_data):
         sales_data = sales_data.copy()
         sales_data[date_col] = pd.to_datetime(sales_data[date_col])
 
-        monthly_sales = sales_data.groupby(pd.Grouper(key=date_col, freq='M'))[amount_col].sum().reset_index()
+        monthly_sales = sales_data.groupby(pd.Grouper(key=date_col, freq='ME'))[amount_col].sum().reset_index()
         monthly_sales = monthly_sales.sort_values(date_col, ascending=False)
 
         if len(monthly_sales) < comparison_periods + 1:

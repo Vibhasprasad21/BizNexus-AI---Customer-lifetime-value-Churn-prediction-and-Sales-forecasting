@@ -599,7 +599,7 @@ class CustomerLookupPage:
         # Convert customer details to a DataFrame for export
         # Create a proper DataFrame with the required 'Forecast' column structure
         # that's expected by the download_report() function
-        dates = pd.date_range(start=datetime.now(), periods=12, freq='M')
+        dates = pd.date_range(start=datetime.now(), periods=12, freq='ME')
         
         # Generate sample forecast data based on CLV
         clv = customer_details.get('CLV_Predicted_CLV', 1000)

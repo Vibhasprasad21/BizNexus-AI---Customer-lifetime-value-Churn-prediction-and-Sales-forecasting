@@ -350,7 +350,7 @@ def compare_period_over_period(state, metric='sales'):
     if df.empty:
         return {'available': False, 'reason': 'No valid transaction dates.'}
 
-    monthly = df.groupby(pd.Grouper(key=date_col, freq='M'))[amount_col].sum().reset_index()
+    monthly = df.groupby(pd.Grouper(key=date_col, freq='ME'))[amount_col].sum().reset_index()
     monthly = monthly.sort_values(date_col, ascending=False)
 
     if len(monthly) < 2:
