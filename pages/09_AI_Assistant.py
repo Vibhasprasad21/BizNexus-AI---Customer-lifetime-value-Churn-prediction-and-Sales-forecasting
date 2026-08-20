@@ -291,7 +291,7 @@ class AIAssistantPage:
         # Add Clear History button
         if st.button("🗑️ Clear Chat History", key="clear_history", help="Clear the current conversation history"):
             st.session_state.chat_history = []
-            st.experimental_rerun()
+            st.rerun()
         
         
         
@@ -432,7 +432,7 @@ class AIAssistantPage:
             print(f"Error processing input: {traceback.format_exc()}")
         
         # Rerun to update the UI
-        st.experimental_rerun()
+        st.rerun()
     
     def render(self):
         """

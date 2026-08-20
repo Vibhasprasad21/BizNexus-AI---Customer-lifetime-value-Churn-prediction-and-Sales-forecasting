@@ -274,7 +274,7 @@ def main():
                             st.success("Account created successfully! Please log in.")
                             time.sleep(1.5)
                             # Switch to login tab
-                            st.experimental_rerun()
+                            st.rerun()
                         else:
                             st.error(f"Registration failed: {result['error']}")
         
