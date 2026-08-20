@@ -156,7 +156,7 @@ def get_logo():
     if os.path.exists(logo_path):
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
-            return st.image(logo_path, width=180, use_column_width=True)  # Increased from 120 to 180
+            return st.image(logo_path, width=180)  # Increased from 120 to 180
     else:
         # If logo doesn't exist, use a placeholder SVG
         logo_html = """
