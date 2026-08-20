@@ -56,7 +56,7 @@ def preprocess_data(df):
     for col in date_columns:
         if col in processed_df.columns:
             # Forward fill for dates where possible
-            processed_df[col] = processed_df[col].fillna(method='ffill')
+            processed_df[col] = processed_df[col].ffill()
             # For any remaining NaT values, use the minimum date
             if processed_df[col].isna().any() and not processed_df[col].dropna().empty:
                 processed_df[col] = processed_df[col].fillna(processed_df[col].min())
