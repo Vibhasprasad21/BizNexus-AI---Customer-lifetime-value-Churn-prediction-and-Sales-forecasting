@@ -1,6 +1,4 @@
 import streamlit as st
-from streamlit.runtime.scriptrunner import RerunData, RerunException
-from streamlit.source_util import get_pages
 
 def requires_auth(page_func):
     """
@@ -29,15 +27,7 @@ def requires_auth(page_func):
 
 def nav_to(page_name: str):
     """Navigate to another page in the Streamlit app"""
-    pages = get_pages("pages")
-    for page_hash, page_config in pages.items():
-        if page_config["page_name"] == page_name:
-            raise RerunException(
-                RerunData(
-                    page_script_hash=page_hash,
-                    page_name=page_config["page_name"],
-                )
-            )
+    st.switch_page(f"pages/{page_name}.py")
 
 def init_session_state():
     """Initialize session state variables if they don't exist"""
