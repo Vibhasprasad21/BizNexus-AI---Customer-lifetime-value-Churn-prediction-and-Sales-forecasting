@@ -321,10 +321,7 @@ def main():
     # Load CSS and background
     load_css()
     load_particles_bg()
-    st.session_state.authenticated = True
-    st.session_state.user_info = {"user_id": "test_user", "email": "test@example.com", "full_name": "Test User", "company_id": "test_company", "company_name": "Test Company", "role": "admin"}
-    st.session_state.company_id = "test_company"
-    
+
     # Logo at the top - Just call once
     with st.container():
         st.markdown('<div class="logo-container">', unsafe_allow_html=True)
